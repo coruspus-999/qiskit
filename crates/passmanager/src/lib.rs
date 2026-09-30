@@ -138,9 +138,13 @@ pub trait IR: DynTyped + Send + Sync + 'static {}
 ///
 /// This is a single unit of execution flow. It describes how work is being executed, ranging
 /// from the simple execution of a single pass, over groups of passes to structured flow control,
-/// such as loops. The [PassManager] stores a vector of [Task]s and executes them.
-#[non_exhaustive]
-pub enum Task {
+/// such as loops. The [PassManager] stores a vector of [Task]s and executes them. Adjacent passes
+/// and tasks in a pipeline must share IR types at their boundary, checked dynamically at
+/// construction.
+pub struct Task(TaskInner);
+
+/// The kinds of [Task].
+enum TaskInner {
     // TODO Add Loop and Switch with conditions that can be set from Python/C and
     // proper error handlings that occur during the condition evaluation.
     /// A single pass.
@@ -155,35 +159,79 @@ pub enum Task {
 
 impl fmt::Debug for Task {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Task::Transformation(p) => f.debug_tuple("Transformation").field(&p.name()).finish(),
-            Task::Group(tasks) => f.debug_tuple("Group").field(tasks).finish(),
-            Task::Stages(stages) => f.debug_tuple("Stages").field(stages).finish(),
+        match &self.0 {
+            TaskInner::Transformation(p) => {
+                f.debug_tuple("Transformation").field(&p.name()).finish()
+            }
+            TaskInner::Group(tasks) => f.debug_tuple("Group").field(tasks).finish(),
+            TaskInner::Stages(stages) => f.debug_tuple("Stages").field(stages).finish(),
         }
     }
 }
 
 impl Task {
     fn io_types(&self) -> Option<[DynTypeId<'_>; 2]> {
-        // TODO: the implementation of `Task` as a `pub enum` means that nothing enforces the
-        // pipeline (dynamic) type safety of `Group`, `Switch` or `Stages`; these need to be
-        // enforced during construction of the `Task`.  This might motivate a swap to a structure
-        // like
-        //
-        //      enum TaskInner {
-        //          Pass(Box<dyn Pass>),
-        //          Group(Vec<Task>),
-        //          // ...
-        //      }
-        //      pub struct Task(TaskInner);
-        //      impl Task {
-        //          pub fn group(vals: Vec<Task>) -> Result<Self, Vec<Task>) {}
-        //          // ...
-        //      }
-        match self {
-            Task::Transformation(pass) => Some([pass.ir_id_in(), pass.ir_id_out()]),
-            Task::Group(group) => sequence_io_types(group.iter()),
-            Task::Stages(stages) => sequence_io_types(stages.iter().map(|(_name, task)| task)),
+        match &self.0 {
+            TaskInner::Transformation(pass) => Some([pass.ir_id_in(), pass.ir_id_out()]),
+            TaskInner::Group(group) => sequence_io_types(group.iter()),
+            TaskInner::Stages(stages) => sequence_io_types(stages.iter().map(|(_name, task)| task)),
+        }
+    }
+}
+
+impl Task {
+    /// Build a task that runs a single pass.
+    pub fn transformation(pass: Box<dyn Pass>) -> Self {
+        Self(TaskInner::Transformation(pass))
+    }
+
+    /// Try to build a task that runs `tasks` in order.
+    pub fn group(tasks: Vec<Task>) -> Result<Self, Vec<Task>> {
+        if first_io_mismatch(tasks.iter()).is_some() {
+            return Err(tasks);
+        }
+        Ok(Self(TaskInner::Group(tasks)))
+    }
+
+    /// Try to build a task that runs named `stages` in order.
+    pub fn stages(stages: Vec<(String, Task)>) -> Result<Self, Vec<(String, Task)>> {
+        if first_io_mismatch(stages.iter().map(|(_name, task)| task)).is_some() {
+            return Err(stages);
+        }
+        Ok(Self(TaskInner::Stages(stages)))
+    }
+
+    /// Execute this task.
+    ///
+    /// This should not be called standalone, passes should be run via the pass manager.
+    fn execute(
+        &self,
+        mut ir: Box<dyn IR>,
+        context: &mut PassContext,
+    ) -> Result<Box<dyn IR>, PassError> {
+        // TODO We might be able to only type-check in the pass manager's execution method,
+        // since the pipeline is already type-checked upon construction. For now we keep it here,
+        // which is the safer choice.
+        if let Some([task_in_type, _]) = self.io_types()
+            && task_in_type != ir.dyn_type_id()
+        {
+            return Err(PassError::Conversion);
+        }
+
+        match &self.0 {
+            TaskInner::Transformation(pass) => pass.run(ir, context),
+            TaskInner::Group(tasks) => {
+                for task in tasks.iter() {
+                    ir = task.execute(ir, context)?;
+                }
+                Ok(ir)
+            }
+            TaskInner::Stages(stages) => {
+                for (_name, task) in stages.iter() {
+                    ir = task.execute(ir, context)?;
+                }
+                Ok(ir)
+            }
         }
     }
 }
@@ -196,6 +244,23 @@ fn sequence_io_types<'a>(
     let first = typed.next()?;
     let last = typed.next_back().unwrap_or(first);
     Some([first[0], last[1]])
+}
+
+/// Return the first output and input types that disagree in a sequence of tasks, if any.
+fn first_io_mismatch<'a>(tasks: impl IntoIterator<Item = &'a Task>) -> Option<[DynTypeId<'a>; 2]> {
+    let mut last_out: Option<DynTypeId<'a>> = None;
+    for task in tasks {
+        let Some([in_, out]) = task.io_types() else {
+            continue;
+        };
+        if let Some(previous) = last_out
+            && previous != in_
+        {
+            return Some([previous, in_]);
+        }
+        last_out = Some(out);
+    }
+    None
 }
 
 /// Qiskit's pass manager.
@@ -240,7 +305,7 @@ impl PassManager {
         let mut context = PassManagerContext::new();
         for task in self.tasks.iter() {
             let mut pass_context = PassContext::spawn(&context);
-            ir = execute_task(task, ir, &mut pass_context)?;
+            ir = task.execute(ir, &mut pass_context)?;
             let PassContext { updates, .. } = pass_context;
             context.update(updates);
         }
@@ -285,45 +350,12 @@ impl PassManager {
         &mut self,
         ob: impl StaticPass<In, Out>,
     ) -> Result<(), Task> {
-        self.try_push_task(Task::Transformation(ob.into_pass()))
+        self.try_push_task(Task::transformation(ob.into_pass()))
     }
 
     /// Get a reference to a [Task] at a given index.
     pub fn get_task(&self, index: usize) -> Option<&Task> {
         self.tasks.get(index)
-    }
-}
-
-/// The task runner. This should not be called standalone, passes should be run
-/// via the pass manager.
-fn execute_task(
-    task: &Task,
-    mut ir: Box<dyn IR>,
-    context: &mut PassContext,
-) -> Result<Box<dyn IR>, PassError> {
-    // TODO We might be able to only type-check in the pass manager's execution method,
-    // since the pipeline is already type-checked upon construction. For now we keep it here,
-    // which is the safer choice.
-    if let Some([task_in_type, _]) = task.io_types()
-        && task_in_type != ir.dyn_type_id()
-    {
-        return Err(PassError::Conversion);
-    }
-
-    match task {
-        Task::Transformation(pass) => pass.run(ir, context),
-        Task::Group(tasks) => {
-            for task in tasks.iter() {
-                ir = execute_task(task, ir, context)?;
-            }
-            Ok(ir)
-        }
-        Task::Stages(stages) => {
-            for (_name, task) in stages.iter() {
-                ir = execute_task(task, ir, context)?;
-            }
-            Ok(ir)
-        }
     }
 }
 
@@ -401,19 +433,20 @@ mod test {
         let uint_ty = DynTypeId::of::<MyUint>();
         let int_ty = DynTypeId::of::<MyInt>();
 
-        let make_uint_pass = || Task::Transformation(AddOne.into_pass());
+        let make_uint_pass = || Task::transformation(AddOne.into_pass());
         assert_eq!(make_uint_pass().io_types().unwrap(), [uint_ty, uint_ty]);
 
-        let lower_pass = Task::Transformation(LowerToInt.into_pass());
+        let lower_pass = Task::transformation(LowerToInt.into_pass());
         assert_eq!(lower_pass.io_types().unwrap(), [uint_ty, int_ty]);
 
-        let stages = Task::Stages(vec![("one_and_only".to_string(), make_uint_pass())]);
+        let stages = Task::stages(vec![("one_and_only".to_string(), make_uint_pass())]).unwrap();
         assert_eq!(stages.io_types().unwrap(), [uint_ty, uint_ty]);
 
-        let nested = Task::Stages(vec![
+        let nested = Task::stages(vec![
             ("pass".to_string(), make_uint_pass()),
             ("stages".to_string(), stages),
-        ]);
+        ])
+        .unwrap();
         assert_eq!(nested.io_types().unwrap(), [uint_ty, uint_ty]);
 
         Ok(())
@@ -421,13 +454,13 @@ mod test {
 
     #[test]
     fn test_io_types_empty() {
-        assert!(Task::Group(vec![]).io_types().is_none());
-        assert!(Task::Stages(vec![]).io_types().is_none());
+        assert!(Task::group(vec![]).unwrap().io_types().is_none());
+        assert!(Task::stages(vec![]).unwrap().io_types().is_none());
 
-        let nested_empty = Task::Group(vec![Task::Stages(vec![(
-            "empty".to_string(),
-            Task::Group(vec![]),
-        )])]);
+        let nested_empty = Task::group(vec![
+            Task::stages(vec![("empty".to_string(), Task::group(vec![]).unwrap())]).unwrap(),
+        ])
+        .unwrap();
         assert!(nested_empty.io_types().is_none());
     }
 
@@ -436,20 +469,21 @@ mod test {
         let uint_ty = DynTypeId::of::<MyUint>();
         let int_ty = DynTypeId::of::<MyInt>();
 
-        let empty = || Task::Group(vec![]);
-        let lower = || Task::Transformation(LowerToInt.into_pass());
+        let empty = || Task::group(vec![]).unwrap();
+        let lower = || Task::transformation(LowerToInt.into_pass());
 
-        let leading = Task::Group(vec![empty(), lower()]);
+        let leading = Task::group(vec![empty(), lower()]).unwrap();
         assert_eq!(leading.io_types().unwrap(), [uint_ty, int_ty]);
 
-        let trailing = Task::Group(vec![lower(), empty()]);
+        let trailing = Task::group(vec![lower(), empty()]).unwrap();
         assert_eq!(trailing.io_types().unwrap(), [uint_ty, int_ty]);
 
-        let surrounded = Task::Stages(vec![
+        let surrounded = Task::stages(vec![
             ("before".to_string(), empty()),
             ("lower".to_string(), lower()),
             ("after".to_string(), empty()),
-        ]);
+        ])
+        .unwrap();
         assert_eq!(surrounded.io_types().unwrap(), [uint_ty, int_ty]);
     }
 
@@ -457,13 +491,12 @@ mod test {
     fn test_empty_child_keeps_type_checks() {
         let mut pm = PassManager::new();
         pm.try_push_static_pass(LowerToInt).unwrap();
-        assert!(
-            pm.try_push_task(Task::Group(vec![
-                Task::Group(vec![]),
-                Task::Transformation(AddOne.into_pass()),
-            ]))
-            .is_err()
-        );
+        let group = Task::group(vec![
+            Task::group(vec![]).unwrap(),
+            Task::transformation(AddOne.into_pass()),
+        ])
+        .unwrap();
+        assert!(pm.try_push_task(group).is_err());
     }
 
     #[test]
@@ -487,25 +520,28 @@ mod test {
 
     #[test]
     fn test_task_retrieval() {
-        let make_task = || Task::Transformation(AddOne.into_pass());
+        let make_task = || Task::transformation(AddOne.into_pass());
 
-        let group = Task::Group(vec![make_task(), make_task()]);
-        let stages = Task::Stages(vec![("one_and_only".to_string(), make_task())]);
+        let group = Task::group(vec![make_task(), make_task()]).unwrap();
+        let stages = Task::stages(vec![("one_and_only".to_string(), make_task())]).unwrap();
 
         let mut pm = PassManager::new();
         pm.try_push_static_pass(AddOne).unwrap();
         pm.try_push_task(group).unwrap();
         pm.try_push_task(stages).unwrap();
 
-        assert!(matches!(pm.get_task(0), Some(Task::Transformation(_))));
+        assert!(matches!(
+            pm.get_task(0),
+            Some(Task(TaskInner::Transformation(_)))
+        ));
 
-        if let Some(Task::Group(group)) = pm.get_task(1) {
+        if let Some(Task(TaskInner::Group(group))) = pm.get_task(1) {
             assert_eq!(group.len(), 2);
         } else {
             panic!("Expected a Task::Group");
         }
 
-        if let Some(Task::Stages(stages)) = pm.get_task(2) {
+        if let Some(Task(TaskInner::Stages(stages))) = pm.get_task(2) {
             assert_eq!(stages.len(), 1);
             assert_eq!(stages[0].0, "one_and_only".to_string());
         } else {
@@ -562,5 +598,59 @@ mod test {
         let lower = LowerToInt.into_pass();
         assert!(add.name().contains("AddOne"));
         assert!(lower.name().contains("LowerToInt"));
+    }
+
+    #[test]
+    fn test_group_rejects_mismatch() {
+        let tasks = vec![
+            Task::transformation(LowerToInt.into_pass()),
+            Task::transformation(AddOne.into_pass()),
+        ];
+        assert_eq!(Task::group(tasks).unwrap_err().len(), 2);
+    }
+
+    #[test]
+    fn test_stages_reject_mismatch() {
+        let stages = vec![
+            (
+                "lower".to_string(),
+                Task::transformation(LowerToInt.into_pass()),
+            ),
+            ("add".to_string(), Task::transformation(AddOne.into_pass())),
+        ];
+        assert_eq!(Task::stages(stages).unwrap_err().len(), 2);
+    }
+
+    #[test]
+    fn test_group_rejects_across_empty() {
+        let tasks = vec![
+            Task::transformation(LowerToInt.into_pass()),
+            Task::group(vec![]).unwrap(),
+            Task::transformation(AddOne.into_pass()),
+        ];
+        assert!(Task::group(tasks).is_err());
+    }
+
+    #[test]
+    fn test_group_accepts_valid_chain() {
+        let tasks = vec![
+            Task::transformation(AddOne.into_pass()),
+            Task::transformation(LowerToInt.into_pass()),
+        ];
+        let group = Task::group(tasks).unwrap();
+        let expected = [DynTypeId::of::<MyUint>(), DynTypeId::of::<MyInt>()];
+        assert_eq!(group.io_types().unwrap(), expected);
+    }
+
+    #[test]
+    fn test_empty_children_keep_types() {
+        let tasks = vec![
+            Task::group(vec![]).unwrap(),
+            Task::transformation(LowerToInt.into_pass()),
+            Task::stages(vec![]).unwrap(),
+        ];
+        let group = Task::group(tasks).unwrap();
+        let expected = [DynTypeId::of::<MyUint>(), DynTypeId::of::<MyInt>()];
+        assert_eq!(group.io_types().unwrap(), expected);
     }
 }
